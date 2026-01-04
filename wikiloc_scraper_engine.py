@@ -1,6 +1,6 @@
 """
 WIKILOC SCRAPER ENGINE - INDUSTRIAL GRADE
-Version: 3.0.0 (Deep Geometry Analysis)
+Version: 3.1.0 (Cloud Compatible + Deep Geometry)
 Author: Gemini / User Request
 
 Este módulo implementa un harvester de alto rendimiento diseñado para:
@@ -8,9 +8,11 @@ Este módulo implementa un harvester de alto rendimiento diseñado para:
 2. Extraer la geometría (lat/lon/elev/time) directamente del DOM sin login.
 3. Calcular índices de 'Micología' basados en patrones de movimiento (ZigZag, Entropía).
 4. Persistencia transaccional en SQLite.
+5. Soporte híbrido: Funciona en Local (Stealth) y en Cloud (Chromium).
 """
 
 import sys
+import os
 import time
 import json
 import math
@@ -29,16 +31,18 @@ import numpy as np
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
-# Selenium Wire (opcional) o Undetected Chromedriver
+# Imports condicionales para Selenium y compatibilidad Cloud
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+
+# Intentamos importar undetected_chromedriver para uso LOCAL
 try:
     import undetected_chromedriver as uc
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    HAS_UC = True
 except ImportError:
-    sys.exit("CRITICAL: Falta 'undetected-chromedriver'. Instala: pip install undetected-chromedriver numpy")
+    HAS_UC = False
 
 # --- CONFIGURACIÓN GLOBAL ---
 LOG_FORMAT = '%(asctime)s [%(levelname)s] (%(module)s): %(message)s'
@@ -74,8 +78,6 @@ CREATE TABLE IF NOT EXISTS scan_history (
 """
 
 # Códigos de actividad de Wikiloc
-# 1: Senderismo, 46: Recolección, 24: Obs. Naturaleza, 
-# 42: Raquetas, 9: Alpinismo (usado para ocultar zonas altas)
 TARGET_ACTIVITIES = ["1", "46", "24", "42", "9", "3"] 
 
 class GeometryEngine:
@@ -138,7 +140,6 @@ class GeometryEngine:
         arr = np.array(coords)
         
         # 1. Calcular cambios de rumbo (heading changes)
-        # Un caminante mantiene rumbo. Un setero cambia drásticamente.
         lats = np.radians(arr[:, 0])
         lons = np.radians(arr[:, 1])
         y = np.sin(np.diff(lons)) * np.cos(lats[1:])
@@ -151,13 +152,10 @@ class GeometryEngine:
         bearing_diff = (bearing_diff + 180) % 360 - 180
         
         # Entropía del movimiento (Caos direccional)
-        # Si la desviación estándar de los cambios de rumbo es alta, hay mucho giro.
         directional_chaos = np.std(bearing_diff)
         
         # Detección de paradas/zonas lentas (Clustering espacial simple)
-        # Simplificamos: contamos puntos muy cercanos consecutivos
         dists = GeometryEngine.haversine_vectorized(arr)
-        # Si hay muchos puntos con distancias < 5 metros entre ellos, es una parada o búsqueda minuciosa
         slow_segments = np.sum(dists < 0.005) # Menos de 5 metros
         stop_ratio = slow_segments / len(dists)
         
@@ -192,37 +190,96 @@ class DatabaseManager:
             conn.execute(sql, list(data.values()))
 
 class BrowserCore:
-    """Wrapper de Selenium con técnicas anti-detección."""
+    """
+    Wrapper Híbrido: Funciona en Local (Stealth) y en Streamlit Cloud (Chromium).
+    NO BORRA NADA, SOLO AÑADE COMPATIBILIDAD.
+    """
     def __init__(self, headless=True):
         self.headless = headless
         self.ua = UserAgent()
         self.driver = None
 
     def start(self):
-        opts = uc.ChromeOptions()
-        if self.headless:
-            opts.add_argument('--headless')
+        # 1. DETECCIÓN DE ENTORNO STREAMLIT CLOUD
+        # En Cloud, Chromium suele estar en /usr/bin/chromium
+        is_cloud = os.path.exists("/usr/bin/chromium") or os.path.exists("/usr/bin/chromium-browser")
         
-        # Stealth settings
-        opts.add_argument(f'--user-agent={self.ua.random}')
-        opts.add_argument('--no-first-run')
-        opts.add_argument('--no-service-autorun')
-        opts.add_argument('--password-store=basic')
-        opts.add_argument('--disable-blink-features=AutomationControlled')
+        if is_cloud:
+            logger.info("☁️ Entorno Cloud detectado. Usando Chromium estándar.")
+            options = Options()
+            options.add_argument("--headless")  # Obligatorio en cloud
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument(f'--user-agent={self.ua.random}')
+            
+            # Localizar binario
+            if os.path.exists("/usr/bin/chromium"):
+                options.binary_location = "/usr/bin/chromium"
+            elif os.path.exists("/usr/bin/chromium-browser"):
+                options.binary_location = "/usr/bin/chromium-browser"
+
+            try:
+                self.driver = webdriver.Chrome(options=options)
+            except Exception as e:
+                logger.error(f"Fallo driver directo: {e}. Intentando WebDriverManager...")
+                try:
+                    self.driver = webdriver.Chrome(
+                        service=Service(ChromeDriverManager().install()),
+                        options=options
+                    )
+                except Exception as e2:
+                    logger.critical(f"FATAL: No se pudo iniciar Chromium: {e2}")
+                    raise e2
         
-        self.driver = uc.Chrome(options=opts)
-        self.driver.set_page_load_timeout(30)
-        logger.info("Navegador Stealth iniciado.")
+        else:
+            # 2. ENTORNO LOCAL (TU PC) - MODO STEALTH
+            # Usamos undetected_chromedriver para evitar bloqueos
+            if HAS_UC:
+                try:
+                    logger.info("💻 Entorno Local detectado. Usando Stealth Driver.")
+                    opts = uc.ChromeOptions()
+                    if self.headless:
+                        opts.add_argument('--headless')
+                    
+                    opts.add_argument(f'--user-agent={self.ua.random}')
+                    opts.add_argument('--no-first-run')
+                    opts.add_argument('--password-store=basic')
+                    opts.add_argument('--disable-blink-features=AutomationControlled')
+                    
+                    self.driver = uc.Chrome(options=opts)
+                except Exception as e:
+                    logger.warning(f"Error UC: {e}. Fallback a Selenium normal.")
+                    self._start_standard_local()
+            else:
+                self._start_standard_local()
+
+        if self.driver:
+            self.driver.set_page_load_timeout(45)
+
+    def _start_standard_local(self):
+        """Fallback para local si falla UC."""
+        options = Options()
+        if self.headless: options.add_argument("--headless")
+        options.add_argument(f'--user-agent={self.ua.random}')
+        self.driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
 
     def human_scroll(self):
         """Simula scroll humano para triggerear cargas lazy."""
         if not self.driver: return
-        total_height = int(self.driver.execute_script("return document.body.scrollHeight"))
-        for i in range(1, total_height, random.randint(300, 700)):
-            self.driver.execute_script(f"window.scrollTo(0, {i});")
-            time.sleep(random.uniform(0.1, 0.3))
+        try:
+            total_height = int(self.driver.execute_script("return document.body.scrollHeight"))
+            for i in range(1, total_height, random.randint(300, 700)):
+                self.driver.execute_script(f"window.scrollTo(0, {i});")
+                time.sleep(random.uniform(0.1, 0.3))
+        except:
+            pass
 
     def get_page_source(self, url: str) -> str:
+        if not self.driver: self.start()
         try:
             self.driver.get(url)
             # Espera humana variable
@@ -230,11 +287,19 @@ class BrowserCore:
             return self.driver.page_source
         except Exception as e:
             logger.error(f"Error cargando {url}: {e}")
+            try:
+                self.quit()
+                self.start()
+            except: pass
             return ""
 
     def quit(self):
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except:
+                pass
+            self.driver = None
 
 class WikilocHarvester:
     """
@@ -278,40 +343,21 @@ class WikilocHarvester:
         """
         LA JOYA DE LA CORONA.
         Extrae las coordenadas crudas del script JSON incrustado en la página de detalle.
-        Evita tener que loguearse o descargar GPX.
         """
         try:
-            # Wikiloc guarda los puntos a veces en un script con 'var mapData' o dentro de un JSON-LD
-            # Método 1: Buscar patrón de coordenadas en scripts
-            # Formato habitual en leaflet: [lat, lon], [lat, lon]...
-            
             # Buscamos bloques grandes de números decimales
-            # Esta regex es agresiva, busca arrays de coordenadas
             pattern = re.compile(r'\[\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*\]')
             matches = pattern.findall(html)
             
-            # Filtramos matches que parezcan coordenadas geográficas válidas en España aprox
             valid_coords = []
             for lat_s, lon_s in matches:
                 lat, lon = float(lat_s), float(lon_s)
-                # Filtro burdo para descartar otros arrays numéricos del JS
+                # Filtro burdo para descartar otros arrays numéricos del JS (Spain bounds approx)
                 if 27 < lat < 45 and -19 < lon < 5: 
                     valid_coords.append((lat, lon))
             
-            # Si encontramos muchos, asumimos que es el track
             if len(valid_coords) > 50:
-                # A veces vienen duplicados o desordenados si pillamos varios scripts, 
-                # pero para tortuosidad nos vale la densidad
                 return valid_coords
-
-            # Método 2: Buscar en el JSON del mapa (más preciso si la estructura no ha cambiado)
-            soup = BeautifulSoup(html, 'html.parser')
-            scripts = soup.find_all('script')
-            for s in scripts:
-                if s.string and 'points' in s.string:
-                    # Intentar parsear objetos JS a lo bruto
-                    pass 
-            
             return valid_coords
             
         except Exception as e:
@@ -334,12 +380,6 @@ class WikilocHarvester:
         patterns = GeometryEngine.detect_search_patterns(coords)
         
         # CÁLCULO DE PROBABILIDAD DE SETA (MUSHROOM SCORE)
-        # Factores:
-        # 1. Título genérico (contiene nombre de pueblo o "senderismo") pero alta tortuosidad.
-        # 2. Distancia 'sweet spot' (3-10km).
-        # 3. Alta entropía direccional (muchos giros).
-        # 4. Ratio de paradas alto.
-        
         score = 0
         
         # Geometría (Peso 60%)
@@ -352,6 +392,7 @@ class WikilocHarvester:
         # Metadatos (Peso 40%)
         title_lower = metadata['title'].lower()
         keywords_generic = ["paseo", "vuelta", "ruta", "camino", "senderismo", "mañana"]
+        
         # Si tiene nombre genérico Y geometría compleja -> BINGO
         if any(k in title_lower for k in keywords_generic) and tortuosity > 1.8:
             score += 30
@@ -363,7 +404,7 @@ class WikilocHarvester:
         metadata.update({
             "has_zigzag": patterns['bearing_std'] > 40,
             "tortuosity_index": round(tortuosity, 2),
-            "stop_count": int(patterns['stop_ratio'] * 100), # dummy conversion
+            "stop_count": int(patterns['stop_ratio'] * 100),
             "entropy_score": round(patterns['score'], 2),
             "mushroom_probability": min(100, score),
             "raw_coords_json": json.dumps(coords[:500]) # Guardamos muestra para debug
@@ -375,18 +416,15 @@ class WikilocHarvester:
         """Escanea un sector del grid."""
         for act_id in TARGET_ACTIVITIES:
             for page in range(1, max_pages + 1):
-                # URL de búsqueda por proximidad 'near'
-                # Esto fuerza a Wikiloc a buscar geográficamente, ignorando límites administrativos
                 url = f"{self.base_url}/trails/hiking?act={act_id}&near={lat},{lon}&page={page}"
                 
                 logger.info(f"Escaneando Sector {lat:.3f},{lon:.3f} | Actividad {act_id} | Pag {page}")
                 html = self.browser.get_page_source(url)
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Selectores CSS (sujetos a cambios por Wikiloc, se intentan varios)
+                # Selectores CSS resilientes
                 cards = soup.find_all('div', class_=re.compile(r'TrailCard__Info'))
-                if not cards:
-                    cards = soup.select('.trail-card') # Legacy selector
+                if not cards: cards = soup.select('.trail-card')
                 
                 if not cards:
                     logger.debug("Sector vacío o antibot activado.")
@@ -394,50 +432,41 @@ class WikilocHarvester:
                 
                 for card in cards:
                     try:
-                        # Extracción básica
                         title_tag = card.find('a', class_=re.compile(r'Title'))
                         if not title_tag: continue
                         
                         href = title_tag['href']
                         full_url = self.base_url + href if not href.startswith('http') else href
-                        track_id = href.split('/')[-1].split('-')[-1] # ID sucio pero funcional
+                        track_id = href.split('/')[-1].split('-')[-1]
                         
-                        # Evitar re-scrapear si ya lo tenemos
-                        if self.db.track_exists(track_id):
-                            continue
+                        if self.db.track_exists(track_id): continue
                             
                         title = title_tag.text.strip()
                         
                         # Extracción de Stats
-                        dist_txt = card.text # Fallback
+                        dist_txt = card.text
                         dist = 0.0
-                        # Regex para buscar "12,5 km"
                         m_dist = re.search(r'(\d+[\.,]?\d*)\s*km', dist_txt)
                         if m_dist: dist = float(m_dist.group(1).replace(',', '.'))
                         
-                        # Filtro Preliminar:
-                        # Si es < 2km (paseo perro) o > 20km (trekking duro), ignorar
-                        if dist < 2.0 or dist > 25.0:
-                            continue
+                        # Filtro Preliminar (2-25km)
+                        if dist < 2.0 or dist > 25.0: continue
                         
                         # --- DEEP DIVE ---
-                        # Aquí es donde el script se vuelve "denso". Entramos en cada resultado.
                         meta = {
                             "id": hashlib.md5(full_url.encode()).hexdigest(),
                             "external_id": track_id,
                             "title": title,
                             "total_dist_km": dist,
-                            "author": "Unknown", # Se podría sacar
+                            "author": "Unknown",
                             "activity_type": act_id,
                             "scraped_at": datetime.now()
                         }
                         
                         logger.info(f"  -> Analizando geometría de: {title} ({dist}km)")
                         
-                        # Analizar geometría interna
                         final_data = self.analyze_track_deep(full_url, meta)
                         
-                        # Guardar solo si tiene mínima probabilidad
                         if final_data.get('mushroom_probability', 0) > 20:
                             self.db.save_track(final_data)
                             logger.info(f"  [GUARDADO] Score: {final_data['mushroom_probability']}")
@@ -458,20 +487,17 @@ class WikilocHarvester:
             for i, (lat, lon) in enumerate(grid):
                 logger.info(f"Progreso Grid: {i+1}/{total}")
                 self.scrape_grid_sector(lat, lon)
-                
-                # Pausa entre sectores para enfriar
                 time.sleep(random.uniform(5, 10))
                 
         except KeyboardInterrupt:
             logger.warning("Campaña abortada por usuario.")
+        except Exception as e:
+            logger.error(f"Error crítico en campaña: {e}")
         finally:
             self.browser.quit()
             logger.info("Campaña finalizada. Drivers cerrados.")
 
-# --- ENTRY POINT ---
-
 if __name__ == "__main__":
-    # Ejemplo de uso directo (Test)
-    # Bronchales
-    harvester = WikilocHarvester(headless=False) # Headless False para ver qué hace
-    harvester.run_campaign("Bronchales_Deep_Scan", 40.508, -1.588, radius_km=5)
+    # Test rápido local
+    harvester = WikilocHarvester(headless=False)
+    harvester.run_campaign("TEST_RUN", 40.416, -3.703, radius_km=1)
