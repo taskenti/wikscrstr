@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+plotly
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+gpxpy
+geopy
+scikit-learn
+lxml
+openpyxl
