@@ -11,3 +11,4 @@ geopy
 scikit-learn
 lxml
 openpyxl
+folium
