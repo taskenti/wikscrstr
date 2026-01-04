@@ -13,5 +13,5 @@ lxml
 openpyxl
 folium
 streamlit-folium
-undetected-chromedriver
 fake-useragent
+# undetected-chromedriver  <-- A veces da problemas en cloud, lo usaremos condicionalmente
