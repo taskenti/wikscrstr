@@ -12,3 +12,6 @@ scikit-learn
 lxml
 openpyxl
 folium
+streamlit-folium
+undetected-chromedriver
+fake-useragent
